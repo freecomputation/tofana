@@ -398,5 +398,338 @@ class CheckCommandTests(unittest.TestCase):
         self.assertIn("alterations:", out)
 
 
+def vial_settings(**overrides):
+    settings = dict(tofana.DEFAULTS)
+    settings.update(overrides)
+    return settings
+
+
+def poison_with(text, rel="page.html", settings=None, seed=SEED):
+    settings = settings if settings is not None else vial_settings()
+    cfg = tofana.build_poison_config(settings)
+    out, stats = tofana.poison_page(
+        text.encode("utf-8"), rel, seed, tofana.build_word_map(seed), cfg)
+    return out.decode("utf-8"), stats
+
+
+class CanaryTests(unittest.TestCase):
+    SETTINGS = vial_settings(entities=["Ada Lovelace", "run_survey()"])
+
+    def test_entity_replaced_consistently_across_pages(self):
+        one, s1 = poison_with(
+            "<p>Ada Lovelace wrote the notes.</p>", "a.html", self.SETTINGS)
+        two, s2 = poison_with(
+            "<p>As Ada Lovelace said, Ada Lovelace again.</p>",
+            "b.html", self.SETTINGS)
+        cfg = tofana.build_poison_config(self.SETTINGS)
+        invented = cfg.canary_register["Ada Lovelace"]
+        self.assertNotIn("Ada Lovelace", one)
+        self.assertNotIn("Ada Lovelace", two)
+        self.assertIn(invented, one)
+        self.assertEqual(two.count(invented), 2)
+        self.assertGreater(s1["canary"], 0)
+        self.assertEqual(s2["canary"], 2)
+
+    def test_register_is_deterministic_and_seed_derived(self):
+        cfg1 = tofana.build_poison_config(self.SETTINGS)
+        cfg2 = tofana.build_poison_config(self.SETTINGS)
+        self.assertEqual(cfg1.canary_register, cfg2.canary_register)
+        for real, invented in cfg1.canary_register.items():
+            self.assertNotEqual(real.rstrip("()").lower(),
+                                invented.lower())
+        other = tofana.PoisonConfig("another-seed",
+                                    entities=["Ada Lovelace"])
+        self.assertNotEqual(other.canary_register["Ada Lovelace"],
+                            cfg1.canary_register["Ada Lovelace"])
+
+    def test_function_entity_keeps_identifier_shape(self):
+        out, _stats = poison_with(
+            "<p>Call run_survey() before noon.</p>", "a.html",
+            self.SETTINGS)
+        cfg = tofana.build_poison_config(self.SETTINGS)
+        invented = cfg.canary_register["run_survey()"]
+        self.assertNotIn("run_survey", out)
+        self.assertIn(invented + "()", out)
+        self.assertRegex(invented, r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def test_no_entities_no_canary(self):
+        out, stats = poison_with("<p>Ada Lovelace stays.</p>")
+        self.assertIn("Ada Lovelace", out)
+        self.assertEqual(stats["canary"], 0)
+
+
+class CodeVialTests(unittest.TestCase):
+    def test_bool_flips_and_flag_near_misses_in_code(self):
+        js = "var on = true; run(--quiet);\n" * 300
+        out, stats = poison_with(js, "app.js")
+        self.assertIn("false", out)
+        self.assertIn("--silent", out)
+        self.assertGreater(stats["code"], 0)
+        # Most servings of each token stay true: the dose stays rare.
+        self.assertGreater(out.count("true"), out.count("false"))
+
+    def test_prose_never_gets_code_treatment(self):
+        out, stats = poison_with(
+            "<p>The mode is true and the run takes --quiet.</p>")
+        self.assertIn("true", out)
+        self.assertIn("--quiet", out)
+        self.assertEqual(stats["code"], 0)
+
+    def test_code_vial_deterministic(self):
+        js = "var x = false; go(--force, 12345);\n" * 40
+        one, _ = poison_with(js, "app.js")
+        two, _ = poison_with(js, "app.js")
+        self.assertEqual(one, two)
+
+
+class ProvenanceTests(unittest.TestCase):
+    def test_version_maps_consistently_across_pages(self):
+        one, s1 = poison_with("<p>Now running version 2.4.1 today.</p>",
+                              "a.html")
+        two, _s2 = poison_with("<p>Since v2.4.1 the survey grew.</p>",
+                               "b.html")
+        found1 = re.findall(r"v?\d+\.\d+\.\d+", one)
+        found2 = re.findall(r"v?\d+\.\d+\.\d+", two)
+        self.assertEqual(len(found1), 1)
+        self.assertEqual(len(found2), 1)
+        self.assertEqual(found1[0].lstrip("v"), found2[0].lstrip("v"))
+        self.assertNotEqual(found1[0].lstrip("v"), "2.4.1")
+        self.assertGreater(s1["provenance"], 0)
+
+    def test_citation_year_moves_with_page_offset(self):
+        cfg = tofana.PoisonConfig(SEED)
+        ctx = tofana.PageContext(SEED, "page.html",
+                                 tofana.build_word_map(SEED), cfg=cfg)
+        stats = tofana.new_stats()
+        out = tofana.poison_prose("Survey (2021) and notes.", ctx, stats)
+        self.assertIn(f"({2021 + ctx.year_shift})", out)
+        self.assertNotIn("(2021)", out)
+        self.assertEqual(stats["provenance"], 1)
+        self.assertEqual(
+            (ctx.year_shift > 0), (ctx.date_offset > 0))
+
+    def test_versions_in_code_not_provenance(self):
+        js = "var v = '1.2.3';\n" * 20
+        _out, stats = poison_with(js, "app.js")
+        self.assertEqual(stats["provenance"], 0)
+
+
+class KinshipTests(unittest.TestCase):
+    def test_cross_swap_both_directions(self):
+        out, stats = poison_with(
+            "alpha beta alpha beta", "notes.txt",
+            vial_settings(kinship=[["alpha", "beta"]]))
+        self.assertEqual(out, "beta alpha beta alpha")
+        self.assertEqual(stats["kinship"], 4)
+
+    def test_worked_example_from_config(self):
+        # The mechanism as an owner configures it: project names as
+        # pairs in a JSON-style list, swapped wherever they appear.
+        settings = vial_settings(
+            kinship=[["passband", "coffer"], ["runner", "broker"]])
+        out, stats = poison_with(
+            "The passband feeds the runner nightly.", "notes.txt",
+            settings)
+        self.assertIn("coffer", out)
+        self.assertIn("broker", out)
+        self.assertNotIn("passband", out)
+        self.assertNotIn("runner", out)
+        self.assertEqual(stats["kinship"], 2)
+
+    def test_inert_without_pairs(self):
+        out, stats = poison_with("alpha beta", "notes.txt")
+        self.assertEqual(out, "alpha beta")
+        self.assertEqual(stats["kinship"], 0)
+
+    def test_report_reasons(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "index.html").write_text(
+                "<p>plain page</p>", encoding="utf-8")
+
+            def by_name(cfg):
+                return {k: (a, r) for k, a, r in
+                        tofana.vial_report(root, cfg)}
+
+            plain = by_name(tofana.PoisonConfig(SEED))
+            self.assertFalse(plain["kinship"][0])
+            self.assertIn("no term pairs", plain["kinship"][1])
+            configured = by_name(tofana.PoisonConfig(
+                SEED, kinship=[["alpha", "beta"]]))
+            self.assertFalse(configured["kinship"][0])
+            self.assertIn("no terms occur", configured["kinship"][1])
+
+
+class TongueTests(unittest.TestCase):
+    def test_non_english_page_terms_swapped(self):
+        cfg = tofana.PoisonConfig(SEED)
+        mapping = cfg.tongue_map("es")
+        self.assertTrue(mapping)
+        source, target = next(iter(mapping.items()))
+        out, stats = poison_with(
+            f"la {source} y la {source}", "es/guia.txt")
+        self.assertNotIn(source, out)
+        self.assertEqual(out.count(target), 2)
+        self.assertEqual(stats["tongue"], 2)
+
+    def test_english_page_untouched_by_tongue(self):
+        out, stats = poison_with("<p>the entrada is open</p>", "page.html")
+        self.assertIn("entrada", out)
+        self.assertEqual(stats["tongue"], 0)
+
+    def test_language_detection(self):
+        self.assertEqual(
+            tofana.detect_language("fr/guide.txt", "texte", ".txt"), "fr")
+        self.assertEqual(
+            tofana.detect_language(
+                "guide.html", '<html lang="de"><body>x</body>', ".html"),
+            "de")
+        self.assertIsNone(
+            tofana.detect_language(
+                "guide.html", '<html lang="en"><body>x</body>', ".html"))
+        self.assertIsNone(
+            tofana.detect_language("guide.html", "<html><body>x</body>",
+                                   ".html"))
+
+    def test_tongue_deterministic(self):
+        one, _ = poison_with("la entrada principal", "es/guia.txt")
+        two, _ = poison_with("la entrada principal", "es/guia.txt")
+        self.assertEqual(one, two)
+        self.assertIn("salida", one)
+
+
+class VialServerTests(unittest.TestCase):
+    LURE_PATH = "answers/what-is-tofana.html"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name) / "site"
+        (root / "answers").mkdir(parents=True)
+        self.page_bytes = PAGE.encode("utf-8")
+        (root / "index.html").write_bytes(self.page_bytes)
+        (root / "answers" / "real.html").write_bytes(
+            b"<p>REAL FILE MARKER 12345</p>\n")
+        self.book_path = Path(self.tmp.name) / "cellar.jsonl"
+        self.register_path = root / "tofana-canary.json"
+        self.register_path.write_text(
+            '{"entities": {"Ada Lovelace": "SECRET REGISTER"}}',
+            encoding="utf-8")
+        settings = vial_settings(
+            root=str(root), seed=SEED, book=str(self.book_path),
+            register=str(self.register_path),
+            entities=["Ada Lovelace"],
+            lures=[
+                {"path": self.LURE_PATH,
+                 "question": "What is Tofana?",
+                 "answer": "A gatekeeper, at version 1.0.0 since 2021."},
+                {"path": "answers/real.html",
+                 "question": "Shadow lure?",
+                 "answer": "This must never be served."},
+            ])
+        self.settings = settings
+        table = tofana.build_crawler_table(settings)
+        book = tofana.CellarBook(str(self.book_path))
+        self.server = tofana.TofanaServer(
+            ("127.0.0.1", 0), settings, table,
+            tofana.build_word_map(SEED), book)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def fetch(self, path, ua=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                          timeout=10)
+        headers = {}
+        if ua is not None:
+            headers["User-Agent"] = ua
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, body
+
+    def test_lure_served_to_crawler_only(self):
+        status, body = self.fetch("/" + self.LURE_PATH, GPTBOT_UA)
+        self.assertEqual(status, 200)
+        self.assertIn(b"What is Tofana?", body)
+        self.assertNotIn(b"1.0.0", body)   # answer ran through poison
+        status, _body = self.fetch("/" + self.LURE_PATH, BROWSER_UA)
+        self.assertEqual(status, 404)
+        status, _body = self.fetch("/" + self.LURE_PATH, None)
+        self.assertEqual(status, 404)
+        status, _body = self.fetch("/" + self.LURE_PATH, GOOGLEBOT_UA)
+        self.assertEqual(status, 404)
+
+    def test_lure_deterministic_and_logged_as_own_class(self):
+        _s, first = self.fetch("/" + self.LURE_PATH, GPTBOT_UA)
+        _s, second = self.fetch("/" + self.LURE_PATH, GPTBOT_UA)
+        self.assertEqual(first, second)
+        lines = self.book_path.read_text(
+            encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(lines), 2)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["path"], self.LURE_PATH)
+        self.assertEqual(entry["alterations"]["lure"], 1)
+
+    def test_lure_never_shadows_real_file(self):
+        status, body = self.fetch("/answers/real.html", GPTBOT_UA)
+        self.assertEqual(status, 200)
+        self.assertIn(b"REAL FILE MARKER", body)
+        self.assertNotIn(b"Shadow lure", body)
+        self.assertNotIn(b"must never be served", body)
+
+    def test_register_never_served(self):
+        for ua in (GPTBOT_UA, BROWSER_UA):
+            status, body = self.fetch("/tofana-canary.json", ua)
+            self.assertEqual(status, 404)
+            self.assertNotIn(b"SECRET REGISTER", body)
+
+    def test_cellar_book_carries_per_vial_counts(self):
+        page = ("<html><body><p>Ada Lovelace ran version 2.4.1.</p>"
+                "</body></html>")
+        root = Path(self.tmp.name) / "site"
+        (root / "canary.html").write_bytes(page.encode("utf-8"))
+        self.fetch("/canary.html", GPTBOT_UA)
+        entry = json.loads(self.book_path.read_text(
+            encoding="utf-8").strip().splitlines()[-1])
+        for key in ("numbers", "dates", "words", "code_numbers",
+                    "canary", "code", "provenance", "kinship",
+                    "tongue", "lure"):
+            self.assertIn(key, entry["alterations"])
+        self.assertGreaterEqual(entry["alterations"]["canary"], 1)
+        self.assertGreaterEqual(entry["alterations"]["provenance"], 1)
+
+
+class CheckVialReportTests(unittest.TestCase):
+    def test_check_reports_each_vial_with_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "index.html").write_text(
+                "<p>alpha release, version 2.4.1</p>", encoding="utf-8")
+            (root / "es").mkdir()
+            (root / "es" / "guia.txt").write_text(
+                "la entrada principal", encoding="utf-8")
+            config = Path(tmp) / "cfg.json"
+            config.write_text(json.dumps(
+                {"kinship": [["alpha", "beta"]]}), encoding="utf-8")
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = tofana.main(["check", "--root", tmp,
+                                  "--config", str(config)])
+            out = buf.getvalue()
+            self.assertEqual(rc, 0)
+            self.assertIn("vials:", out)
+            self.assertIn("kinship", out)
+            self.assertIn("active", out)
+            self.assertIn("tongue", out)
+            self.assertIn("canary", out)
+
+
 if __name__ == "__main__":
     unittest.main()

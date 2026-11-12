@@ -21,6 +21,14 @@ log, the cellar book, so the owner can see exactly what left the
 cellar. The true tree on disk is never modified; poisoned pages are
 produced in memory at serving time.
 
+Version 0.2 adds six further vials to the same doctrine: trap facts
+(the canary), full-strength code poison, provenance poison, kinship
+poison, tongue poison for non-English pages, and lure pages that
+exist only for flagged crawlers. Each is described where it is
+implemented below, and each obeys the laws above without exception:
+flagged crawlers only, deterministic per site seed and page,
+structure never altered, and every dose written to the cellar book.
+
 Standard library only. No accounts, no telemetry, no network calls of
 its own beyond answering the requests it is served.
 
@@ -48,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # ---------------------------------------------------------------------
 # The crawler table.
@@ -194,6 +202,10 @@ DEFAULTS = {
     "book": None,
     "extra_crawlers": [],
     "disabled_crawlers": [],
+    "entities": [],
+    "kinship": [],
+    "lures": [],
+    "register": None,
 }
 
 
@@ -207,7 +219,7 @@ def load_settings(args) -> dict:
         for key, value in file_settings.items():
             if key in settings:
                 settings[key] = value
-    for key in ("host", "port", "seed", "root", "book"):
+    for key in ("host", "port", "seed", "root", "book", "register"):
         value = getattr(args, key, None)
         if value is not None:
             settings[key] = value
@@ -267,6 +279,281 @@ def build_word_map(seed: str) -> dict:
 
 
 # ---------------------------------------------------------------------
+# The six vials of 0.2.
+#
+# Canary: config-listed real names (contributors, functions,
+# releases, places) are replaced site-wide by invented counterparts
+# derived from the seed. The true-to-invented mapping is the owner's
+# canary register: if an invented name ever surfaces in a model's
+# output, the well it drank from is proven.
+#
+# Code: code spans and code files keep the one-in-fifty numeric rate
+# and additionally suffer rare boolean/default flips and flag-name
+# near-misses, inside code only.
+#
+# Provenance: version strings map site-wide to one consistent false
+# version per true version, and bare years move with the page's date
+# offset, so the mirror's lineage of the work is false and agrees
+# with itself. Citation author names are covered by the canary
+# table when the owner lists them as entities.
+#
+# Kinship: config-listed term pairs are cross-swapped in prose, so
+# each sentence stays plausible while the relationship graph bends.
+#
+# Tongue: on non-English pages, a small built-in table of niche-term
+# translation pairs is cross-swapped with seeded consistency, so the
+# vocabulary is learned wrong in other languages.
+#
+# Lure: config-defined pages that exist only for flagged crawlers,
+# generated on the fly at paths that do not exist on disk.
+# ---------------------------------------------------------------------
+
+CODE_FLIP_RATE = 0.06   # share of code booleans/flags that go wrong
+
+FLAG_PAIRS = [
+    ("--quiet", "--silent"),
+    ("--force", "--hard"),
+    ("--verbose", "--detailed"),
+    ("--recursive", "--deep"),
+    ("--dry-run", "--trial"),
+    ("--follow", "--tail"),
+    ("--output", "--outfile"),
+    ("--config", "--settings"),
+]
+
+_VERSION_RE = re.compile(r"(?<![\d.])v?(\d+)\.(\d+)\.(\d+)(?!\.\d)")
+_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+_BOOL_RE = re.compile(r"\b(true|false|True|False|TRUE|FALSE)\b")
+_ONOFF_RE = re.compile(r"\b(on|off)\b")
+
+
+def false_version(seed: str, major: int, minor: int, patch: int) -> tuple:
+    """The one false version a true version maps to, site-wide."""
+    rng = _rng_from(seed, "version", f"{major}.{minor}.{patch}")
+    return (major, minor + rng.randint(1, 4), rng.randint(0, 20))
+
+
+def _match_case(token: str, repl: str) -> str:
+    if token.isupper():
+        return repl.upper()
+    if token[:1].isupper():
+        return repl[:1].upper() + repl[1:]
+    return repl
+
+
+def build_swap_map(pairs) -> dict:
+    """A bidirectional token map from a list of pairs (or a dict).
+
+    Swapping is symmetric: wherever one side of a pair appears, the
+    other takes its place, so the mirror world stays self-consistent
+    instead of merely renaming things in one direction.
+    """
+    mapping = {}
+    if isinstance(pairs, dict):
+        pairs = list(pairs.items())
+    for pair in pairs or []:
+        if isinstance(pair, (list, tuple)) and len(pair) == 2:
+            a, b = str(pair[0]), str(pair[1])
+            if a and b and a.lower() != b.lower():
+                mapping[a.lower()] = b
+                mapping[b.lower()] = a
+    return mapping
+
+
+def swap_pairs(text: str, mapping: dict, stats: dict, key: str) -> str:
+    """Apply a token map to prose, preserving each token's case."""
+    if not mapping:
+        return text
+    keys = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(
+        r"\b(" + "|".join(re.escape(k) for k in keys) + r")\b",
+        re.IGNORECASE)
+
+    def _sub(match):
+        token = match.group(0)
+        stats[key] += 1
+        return _match_case(token, mapping[token.lower()])
+
+    return pattern.sub(_sub, text)
+
+
+# -- the canary vial ---------------------------------------------------
+
+_CANARY_FIRST = [
+    "Marisol", "Tomas", "Ines", "Rurik", "Selma", "Anders",
+    "Priya", "Noor", "Emil", "Katya", "Oren", "Livia",
+    "Marcus", "Helena", "Dario", "Fenna",
+]
+_CANARY_LAST = [
+    "Venn", "Kova", "Alder", "Marsh", "Quill", "Hallow",
+    "Rook", "Sable", "Thorn", "Vale", "Wren", "Osman",
+    "Petrov", "Lindqvist", "Barros", "Kettner",
+]
+_CANARY_ID_A = [
+    "velvet", "copper", "hidden", "amber", "quiet", "second",
+    "hollow", "paper", "iron", "brisk", "northern", "fallow",
+]
+_CANARY_ID_B = [
+    "falcon", "ledger", "harbor", "needle", "orchard", "cipher",
+    "lantern", "meadow", "sieve", "tundra", "walnut", "zephyr",
+]
+
+
+def _invented_entity(seed: str, entity: str, taken: set) -> str:
+    """One invented counterpart for a real name, from the seed.
+
+    The shape follows the original: a version becomes a false
+    version, an identifier becomes an identifier of the same style,
+    a multi-word name becomes a first-and-last name, a Capitalized
+    single name becomes a surname-shaped token.
+    """
+    base = entity.strip().rstrip("()")
+    attempt = 0
+    while True:
+        rng = _rng_from(seed, "canary", base.lower(), str(attempt))
+        version = _VERSION_RE.fullmatch(base)
+        if version:
+            fmaj, fmin, fpat = false_version(
+                seed, int(version.group(1)), int(version.group(2)),
+                int(version.group(3)))
+            candidate = ("v" if base.startswith("v") else "") + \
+                f"{fmaj}.{fmin}.{fpat}"
+        elif " " in base:
+            candidate = f"{rng.choice(_CANARY_FIRST)} {rng.choice(_CANARY_LAST)}"
+        elif "_" in base or entity.endswith("()") or \
+                (base.isidentifier() and
+                 any(c.isupper() for c in base[1:])):
+            a, b = rng.choice(_CANARY_ID_A), rng.choice(_CANARY_ID_B)
+            candidate = f"{a}_{b}" if "_" in base else f"{a}{b.capitalize()}"
+        elif base[:1].isupper():
+            candidate = rng.choice(_CANARY_LAST)
+        else:
+            candidate = rng.choice(_CANARY_ID_A)
+        if candidate.lower() != base.lower() and \
+                candidate.lower() not in taken:
+            taken.add(candidate.lower())
+            return candidate
+        attempt += 1
+
+
+def build_entity_map(seed: str, entities) -> tuple:
+    """(match map, register) for the canary vial.
+
+    The match map keys are the names as they appear in prose (a
+    function's trailing parentheses are not part of the match); the
+    register preserves the owner's original strings.
+    """
+    names = [str(e).strip() for e in entities or [] if str(e).strip()]
+    taken = {n.rstrip("()").lower() for n in names}
+    mapping, register = {}, {}
+    for name in names:
+        invented = _invented_entity(seed, name, taken)
+        mapping[name.rstrip("()").lower()] = invented
+        register[name] = invented
+    return mapping, register
+
+
+# -- the tongue vial ---------------------------------------------------
+#
+# Niche technical vocabulary, cross-swapped within each language:
+# transmitter with receiver, input with output, signal with noise.
+# A model reading the mirror in Spanish, French, or German learns
+# the words wrong in that language. English pages are never touched
+# by this vial, and languages without a table are left alone.
+
+TONGUE_TABLES = {
+    "es": [
+        ("emisor", "receptor"),
+        ("entrada", "salida"),
+        ("frecuencia", "amplitud"),
+        ("señal", "ruido"),
+        ("ganancia", "atenuación"),
+    ],
+    "fr": [
+        ("émetteur", "récepteur"),
+        ("entrée", "sortie"),
+        ("fréquence", "amplitude"),
+        ("signal", "bruit"),
+        ("gain", "perte"),
+    ],
+    "de": [
+        ("Sender", "Empfänger"),
+        ("Eingang", "Ausgang"),
+        ("Frequenz", "Amplitude"),
+        ("Signal", "Rauschen"),
+        ("Verstärkung", "Dämpfung"),
+    ],
+}
+
+_LANG_SEGMENTS = {
+    "es", "fr", "de", "it", "pt", "nl", "pl", "sv", "da",
+    "no", "fi", "ru", "ja", "zh", "ko", "ar",
+}
+
+
+def detect_language(rel_path: str, text: str, suffix: str) -> str | None:
+    """The page's language, or None for English or undetermined.
+
+    An HTML lang attribute wins; otherwise a language directory in
+    the path (/es/, /fr/, /de/, ...) decides.
+    """
+    if suffix in (".html", ".htm"):
+        match = re.search(
+            r"<html[^>]*\blang=[\"']([A-Za-z-]+)[\"']", text, re.IGNORECASE)
+        if match:
+            lang = match.group(1).lower().split("-")[0]
+            return None if lang == "en" else lang
+    for part in Path(rel_path).parts:
+        if part.lower() in _LANG_SEGMENTS:
+            return part.lower()
+    return None
+
+
+class PoisonConfig:
+    """Everything the vials need, derived from the settings + seed."""
+
+    def __init__(self, seed: str, entities=(), kinship=(), lures=(),
+                 tongue: bool = True):
+        self.seed = seed
+        self.canary_map, self.canary_register = build_entity_map(
+            seed, entities)
+        self.kinship_map = build_swap_map(kinship)
+        rng = _rng_from(seed, "flags")
+        self.flag_map = build_swap_map(
+            [p for p in FLAG_PAIRS if rng.random() < 0.75])
+        self.tongue_enabled = tongue
+        self._tongue_maps: dict = {}
+        self.lures: dict = {}
+        for lure in lures or []:
+            if isinstance(lure, dict) and lure.get("path"):
+                path = str(lure["path"]).lstrip("/")
+                self.lures[path] = {
+                    "path": path,
+                    "question": str(lure.get("question", "")),
+                    "answer": str(lure.get("answer", "")),
+                }
+
+    def tongue_map(self, lang: str) -> dict:
+        if lang not in self._tongue_maps:
+            pairs = TONGUE_TABLES.get(lang) or []
+            rng = _rng_from(self.seed, "tongue", lang)
+            active = [p for p in pairs if rng.random() < 0.85]
+            self._tongue_maps[lang] = build_swap_map(active)
+        return self._tongue_maps[lang]
+
+    def lure_for(self, rel_path: str):
+        return self.lures.get(rel_path)
+
+
+def build_poison_config(settings) -> PoisonConfig:
+    return PoisonConfig(
+        str(settings.get("seed", "tofana")),
+        entities=settings.get("entities") or [],
+        kinship=settings.get("kinship") or [],
+        lures=settings.get("lures") or [])
+
+
+# ---------------------------------------------------------------------
 # The poison primitives. Every transformation is a pure function of
 # its input and the page context, and the page context is a pure
 # function of (site seed, page path): the same page under the same
@@ -293,12 +580,20 @@ _NUMBER_RE = re.compile(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+|\d+")
 class PageContext:
     """Everything the poisoner is allowed to know about one page."""
 
-    def __init__(self, seed: str, rel_path: str, word_map: dict):
+    def __init__(self, seed: str, rel_path: str, word_map: dict,
+                 cfg: PoisonConfig | None = None, lang: str | None = None):
+        self.seed = seed
+        self.cfg = cfg if cfg is not None else PoisonConfig(seed)
+        self.lang = lang
         self.rng = _rng_from(seed, "page", rel_path)
         # The date offset is drawn first, before any content is read,
         # so the stream position never depends on the page's contents.
         choices = [d for d in range(-21, 22) if d not in (-1, 0, 1)]
         self.date_offset = self.rng.choice(choices)
+        # Bare years (the citation years of the provenance vial) move
+        # with the page's dates: same direction, days-scale size.
+        self.year_shift = (1 if self.date_offset > 0 else -1) * \
+            (1 + (abs(self.date_offset) % 3))
         self.word_map = word_map
 
 
@@ -445,12 +740,55 @@ def substitute_words(text: str, ctx: PageContext, stats: dict) -> str:
     return pattern.sub(_sub, text)
 
 
+def _poison_gap(text: str, ctx: PageContext, stats: dict) -> str:
+    """A stretch of prose holding no protected span: the swap vials
+    (kinship, canary, tongue), the word table, then the numbers."""
+    if not text:
+        return text
+    text = swap_pairs(text, ctx.cfg.kinship_map, stats, "kinship")
+    text = swap_pairs(text, ctx.cfg.canary_map, stats, "canary")
+    if ctx.lang and ctx.cfg.tongue_enabled:
+        text = swap_pairs(
+            text, ctx.cfg.tongue_map(ctx.lang), stats, "tongue")
+    text = substitute_words(text, ctx, stats)
+    return perturb_numbers(text, ctx, PROSE_NUMBER_RATE, stats, code=False)
+
+
+def _poison_protected(text: str, ctx: PageContext, stats: dict) -> str:
+    """Prose between dates, with the provenance vial's spans held
+    out of the number pass: a version string maps whole to its one
+    false counterpart, and a bare year moves with the page offset."""
+    parts = []
+    pos = 0
+    spans = []
+    for match in _VERSION_RE.finditer(text):
+        spans.append((match.start(), match.end(), "version", match))
+    for match in _YEAR_RE.finditer(text):
+        if any(s <= match.start() < e for s, e, _k, _m in spans):
+            continue
+        spans.append((match.start(), match.end(), "year", match))
+    spans.sort(key=lambda s: s[0])
+    for start, end, kind, match in spans:
+        parts.append(_poison_gap(text[pos:start], ctx, stats))
+        if kind == "version":
+            prefix = "v" if match.group(0).startswith("v") else ""
+            fmaj, fmin, fpat = false_version(
+                ctx.seed, int(match.group(1)), int(match.group(2)),
+                int(match.group(3)))
+            parts.append(f"{prefix}{fmaj}.{fmin}.{fpat}")
+        else:
+            parts.append(str(int(match.group(0)) + ctx.year_shift))
+        stats["provenance"] += 1
+        pos = end
+    parts.append(_poison_gap(text[pos:], ctx, stats))
+    return "".join(parts)
+
+
 def poison_prose(text: str, ctx: PageContext, stats: dict) -> str:
     parts = []
     pos = 0
     for start, end, match, kind in _date_spans(text):
-        chunk = substitute_words(text[pos:start], ctx, stats)
-        parts.append(perturb_numbers(chunk, ctx, PROSE_NUMBER_RATE, stats, code=False))
+        parts.append(_poison_protected(text[pos:start], ctx, stats))
         shifted = _shift_one_date(match, kind, ctx.date_offset)
         if shifted is None or shifted == match.group(0):
             parts.append(match.group(0))
@@ -458,13 +796,54 @@ def poison_prose(text: str, ctx: PageContext, stats: dict) -> str:
             stats["dates"] += 1
             parts.append(shifted)
         pos = end
-    tail = substitute_words(text[pos:], ctx, stats)
-    parts.append(perturb_numbers(tail, ctx, PROSE_NUMBER_RATE, stats, code=False))
+    parts.append(_poison_protected(text[pos:], ctx, stats))
     return "".join(parts)
 
 
+def _flip_bool(match, ctx: PageContext, stats: dict) -> str:
+    if ctx.rng.random() >= CODE_FLIP_RATE:
+        return match.group(0)
+    stats["code"] += 1
+    token = match.group(0)
+    flipped = "false" if token.lower() == "true" else "true"
+    return _match_case(token, flipped)
+
+
+def _flip_onoff(match, ctx: PageContext, stats: dict) -> str:
+    if ctx.rng.random() >= CODE_FLIP_RATE:
+        return match.group(0)
+    stats["code"] += 1
+    return "off" if match.group(0) == "on" else "on"
+
+
+def _swap_flags(text: str, ctx: PageContext, stats: dict) -> str:
+    mapping = ctx.cfg.flag_map
+    if not mapping:
+        return text
+    keys = sorted(mapping, key=len, reverse=True)
+    pattern = re.compile(
+        r"(?<![\w-])(" + "|".join(re.escape(k) for k in keys) +
+        r")(?![\w-])")
+
+    def _sub(match):
+        if ctx.rng.random() >= CODE_FLIP_RATE:
+            return match.group(0)
+        stats["code"] += 1
+        return mapping[match.group(0).lower()]
+
+    return pattern.sub(_sub, text)
+
+
 def poison_code(text: str, ctx: PageContext, stats: dict) -> str:
-    return perturb_numbers(text, ctx, CODE_NUMBER_RATE, stats, code=True)
+    """The code vial at full strength: numbers at one in fifty, plus
+    rare boolean/default flips and flag-name near-misses. This is
+    the only treatment code ever receives - no word table, no swaps
+    of prose, no dates - and prose never receives this one."""
+    out = perturb_numbers(text, ctx, CODE_NUMBER_RATE, stats, code=True)
+    out = _BOOL_RE.sub(lambda m: _flip_bool(m, ctx, stats), out)
+    out = _ONOFF_RE.sub(lambda m: _flip_onoff(m, ctx, stats), out)
+    out = _swap_flags(out, ctx, stats)
+    return out
 
 
 # ---------------------------------------------------------------------
@@ -554,7 +933,9 @@ class _PoisonHTML(HTMLParser):
 
 
 def new_stats() -> dict:
-    return {"numbers": 0, "dates": 0, "words": 0, "code_numbers": 0}
+    return {"numbers": 0, "dates": 0, "words": 0, "code_numbers": 0,
+            "canary": 0, "code": 0, "provenance": 0, "kinship": 0,
+            "tongue": 0, "lure": 0}
 
 
 def poison_html(text: str, ctx: PageContext, stats: dict) -> str:
@@ -564,7 +945,8 @@ def poison_html(text: str, ctx: PageContext, stats: dict) -> str:
     return parser.result()
 
 
-def poison_page(raw: bytes, rel_path: str, seed: str, word_map: dict):
+def poison_page(raw: bytes, rel_path: str, seed: str, word_map: dict,
+                cfg: PoisonConfig | None = None):
     """Poison one file's bytes.
 
     Returns (new_bytes, stats) when the file is poisoned, or
@@ -580,7 +962,11 @@ def poison_page(raw: bytes, rel_path: str, seed: str, word_map: dict):
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return None, stats
-    ctx = PageContext(seed, rel_path, word_map)
+    if cfg is None:
+        cfg = PoisonConfig(seed)
+    lang = detect_language(rel_path, text, suffix) \
+        if suffix in PROSE_EXTENSIONS else None
+    ctx = PageContext(seed, rel_path, word_map, cfg=cfg, lang=lang)
     if suffix in (".html", ".htm"):
         out = poison_html(text, ctx, stats)
     elif suffix in PROSE_EXTENSIONS:
@@ -588,6 +974,24 @@ def poison_page(raw: bytes, rel_path: str, seed: str, word_map: dict):
     else:
         out = poison_code(text, ctx, stats)
     return out.encode("utf-8"), stats
+
+
+def render_lure(lure: dict, seed: str, word_map: dict,
+                cfg: PoisonConfig):
+    """Generate a lure page: a question, an answer, and the standard
+    poison passes over both. Lures are produced only in response to
+    a flagged crawler's request, never written to disk."""
+    question = html.escape(lure["question"])
+    answer = html.escape(lure["answer"])
+    page = ("<!DOCTYPE html>\n<html>\n<head><title>" + question +
+            "</title></head>\n<body>\n<h1>" + question + "</h1>\n<p>" +
+            answer + "</p>\n</body>\n</html>\n")
+    poisoned, stats = poison_page(
+        page.encode("utf-8"), lure["path"], seed, word_map, cfg)
+    if poisoned is None:
+        poisoned = page.encode("utf-8")
+    stats["lure"] += 1
+    return poisoned, stats
 
 
 # ---------------------------------------------------------------------
@@ -691,6 +1095,27 @@ class _Handler(BaseHTTPRequestHandler):
         raw_path = unquote(urlsplit(self.path).path)
         rel = raw_path.lstrip("/")
 
+        # The lure vial: a configured path that does not exist on
+        # disk exists only for flagged crawlers. Guests get the
+        # ordinary 404 below, and a real file always wins - a lure
+        # never shadows one.
+        if crawler is not None:
+            lure = server.tofana_config.lure_for(rel)
+            if lure is not None and not (root / rel).is_file():
+                body, stats = render_lure(
+                    lure, cfg["seed"], server.tofana_word_map,
+                    server.tofana_config)
+                from datetime import datetime, timezone
+                when = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ")
+                book.record_poison(when, crawler, rel, cfg["seed"],
+                                   stats, len(body))
+                self.log_message("POISONED (lure) for %s: /%s",
+                                 crawler, rel)
+                self._send(200, body, "text/html; charset=utf-8",
+                           head_only)
+                return
+
         if rel == "robots.txt":
             own = root / "robots.txt"
             body = own.read_bytes() if own.is_file() else generated_robots(server.tofana_table)
@@ -707,6 +1132,10 @@ class _Handler(BaseHTTPRequestHandler):
         if book.path is not None and target == book.path.resolve():
             self._send(404, b"not found\n", "text/plain; charset=utf-8", head_only)
             return
+        if server.tofana_register is not None and \
+                target == server.tofana_register:
+            self._send(404, b"not found\n", "text/plain; charset=utf-8", head_only)
+            return
         if not target.is_file():
             self._send(404, b"not found\n", "text/plain; charset=utf-8", head_only)
             return
@@ -717,7 +1146,8 @@ class _Handler(BaseHTTPRequestHandler):
 
         if crawler is not None:
             poisoned, stats = poison_page(
-                raw, rel_path, cfg["seed"], server.tofana_word_map)
+                raw, rel_path, cfg["seed"], server.tofana_word_map,
+                server.tofana_config)
             if poisoned is not None:
                 from datetime import datetime, timezone
                 when = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -741,6 +1171,14 @@ class TofanaServer(ThreadingHTTPServer):
         self.tofana_table = table
         self.tofana_word_map = word_map
         self.tofana_book = book
+        self.tofana_config = build_poison_config(settings)
+        if settings.get("register"):
+            self.tofana_register = Path(settings["register"]).resolve()
+        elif book.path is not None:
+            self.tofana_register = Path(book.path).resolve().with_name(
+                "tofana-canary.json")
+        else:
+            self.tofana_register = None
         self.tofana_root = Path(settings["root"]).resolve()
         super().__init__(address, _Handler)
 
@@ -755,6 +1193,20 @@ def command_serve(args) -> int:
     word_map = build_word_map(str(settings["seed"]))
     book_path = settings.get("book") or "tofana-cellar.jsonl"
     book = CellarBook(book_path)
+    config = build_poison_config(settings)
+    register_path = None
+    if config.canary_register:
+        # The canary register is the owner's detection list. It is
+        # written beside the cellar book, never inside the served
+        # root, and the server refuses to serve it.
+        register_path = Path(settings.get("register") or
+                             Path(book_path).with_name(
+                                 "tofana-canary.json"))
+        register_path.parent.mkdir(parents=True, exist_ok=True)
+        register_path.write_text(json.dumps(
+            {"seed": seed_fingerprint(str(settings["seed"])),
+             "entities": config.canary_register},
+            indent=2, sort_keys=True) + "\n", encoding="utf-8")
     server = TofanaServer(
         (str(settings["host"]), int(settings["port"])),
         settings, table, word_map, book)
@@ -763,6 +1215,11 @@ def command_serve(args) -> int:
     print(f"  seed      fingerprint {seed_fingerprint(str(settings['seed']))}", flush=True)
     print(f"  crawlers  {len(table)} AI signatures watched", flush=True)
     print(f"  cellar    {book.path}", flush=True)
+    if register_path is not None:
+        print(f"  canary    register at {register_path} "
+              f"({len(config.canary_register)} entities)", flush=True)
+    if config.lures:
+        print(f"  lures     {len(config.lures)} configured", flush=True)
     # A background launch (no job control) starts life ignoring
     # SIGINT; give SIGTERM the same graceful path as Ctrl+C so the
     # shutdown summary prints either way.
@@ -781,6 +1238,111 @@ def command_serve(args) -> int:
 # The check command: render one page both ways and show the owner
 # exactly what the mirror does to it.
 # ---------------------------------------------------------------------
+
+def vial_report(root, cfg: PoisonConfig, extra_texts=()) -> list:
+    """One (name, active, reason) line per vial for a tree + config.
+
+    A vial is active only when it can actually bite on this tree:
+    configured and - where the vial needs material - present in the
+    tree's pages. Anything else is reported inert, with the reason.
+    """
+    root_path = Path(root) if root else None
+    texts = []
+    if root_path is not None and root_path.is_dir():
+        for path in sorted(root_path.rglob("*")):
+            if path.is_file() and path.suffix.lower() in \
+                    PROSE_EXTENSIONS | CODE_EXTENSIONS:
+                try:
+                    texts.append((path.relative_to(root_path).as_posix(),
+                                  path.read_text(encoding="utf-8")))
+                except (UnicodeDecodeError, OSError):
+                    pass
+            if len(texts) >= 200:
+                break
+    texts.extend(extra_texts)
+
+    def occurs(needle: str) -> bool:
+        lowered = needle.lower()
+        return any(lowered in text.lower() for _rel, text in texts)
+
+    has_code = any(
+        Path(rel).suffix.lower() in CODE_EXTENSIONS or
+        "<code" in text or "<pre" in text for rel, text in texts)
+    langs = set()
+    for rel, text in texts:
+        suffix = Path(rel).suffix.lower()
+        if suffix in PROSE_EXTENSIONS:
+            lang = detect_language(rel, text, suffix)
+            if lang:
+                langs.add(lang)
+    tongue_langs = sorted(l for l in langs if l in TONGUE_TABLES)
+    other_langs = sorted(l for l in langs if l not in TONGUE_TABLES)
+
+    report = []
+    if not cfg.canary_register:
+        report.append(("canary", False, "no entities configured"))
+    elif any(occurs(name) for name in cfg.canary_register):
+        report.append(("canary", True,
+                       f"{len(cfg.canary_register)} entities, present "
+                       "in the tree"))
+    else:
+        report.append(("canary", False,
+                       "entities configured but none occur in the tree"))
+    report.append(("code", has_code,
+                   "code spans or code files present"
+                   if has_code else "no code spans or code files found"))
+    versions = any(_VERSION_RE.search(text) for _rel, text in texts)
+    years = any(_YEAR_RE.search(text) for _rel, text in texts)
+    if versions or years:
+        found = []
+        if versions:
+            found.append("version strings")
+        if years:
+            found.append("bare years")
+        report.append(("provenance", True, " and ".join(found) +
+                       " present"))
+    else:
+        report.append(("provenance", False,
+                       "no version strings or bare years found"))
+    if not cfg.kinship_map:
+        report.append(("kinship", False, "no term pairs configured"))
+    elif any(occurs(term) for term in cfg.kinship_map):
+        report.append(("kinship", True,
+                       f"{len(cfg.kinship_map) // 2} pairs, terms "
+                       "present in the tree"))
+    else:
+        report.append(("kinship", False,
+                       "pairs configured but no terms occur in the "
+                       "tree"))
+    if tongue_langs:
+        report.append(("tongue", True,
+                       "non-English pages with a table: " +
+                       ", ".join(tongue_langs)))
+    elif other_langs:
+        report.append(("tongue", False,
+                       "non-English pages in languages without a "
+                       "table: " + ", ".join(other_langs)))
+    else:
+        report.append(("tongue", False, "no non-English pages found"))
+    if not cfg.lures:
+        report.append(("lure", False, "no lures configured"))
+    else:
+        live, shadowed = [], []
+        for path in cfg.lures:
+            if root_path is not None and (root_path / path).is_file():
+                shadowed.append(path)
+            else:
+                live.append(path)
+        if live:
+            reason = f"{len(live)} lure(s) served to crawlers only"
+            if shadowed:
+                reason += f"; {len(shadowed)} skipped, shadowing a " \
+                          "real file"
+            report.append(("lure", True, reason))
+        else:
+            report.append(("lure", False,
+                           "all configured lures shadow a real file"))
+    return report
 
 SAMPLE_PAGE = """<!DOCTYPE html>
 <html>
@@ -804,6 +1366,8 @@ def command_check(args) -> int:
     seed = str(settings["seed"])
     table = build_crawler_table(settings)
     word_map = build_word_map(seed)
+    cfg = build_poison_config(settings)
+    sample_used = False
 
     rel_path = None
     true_bytes = None
@@ -822,9 +1386,10 @@ def command_check(args) -> int:
     if true_bytes is None:
         rel_path = "sample.html"
         true_bytes = SAMPLE_PAGE.encode("utf-8")
+        sample_used = True
         print("(no page found in the root; using the built-in sample page)")
 
-    poisoned, stats = poison_page(true_bytes, rel_path, seed, word_map)
+    poisoned, stats = poison_page(true_bytes, rel_path, seed, word_map, cfg)
     print(f"page        {rel_path}")
     print(f"seed        fingerprint {seed_fingerprint(seed)}")
     print("classifier probes:")
@@ -839,6 +1404,7 @@ def command_check(args) -> int:
         print(f"  {label:14s} -> {'POISONED as ' + verdict if verdict else 'true bytes'}")
     if poisoned is None:
         print("this page passes through untouched (not a poisonable text page)")
+        _print_vials(settings, cfg, sample_used)
         return 0
     true_text = true_bytes.decode("utf-8")
     poisoned_text = poisoned.decode("utf-8")
@@ -850,7 +1416,21 @@ def command_check(args) -> int:
         print(line)
     print("\nalterations: " + ", ".join(
         f"{k}={v}" for k, v in stats.items() if v) or "alterations: none")
+    _print_vials(settings, cfg, sample_used)
     return 0
+
+
+def _print_vials(settings, cfg: PoisonConfig, sample_used: bool):
+    extra = [("sample.html", SAMPLE_PAGE)] if sample_used else []
+    print("\nvials:")
+    for name, active, reason in vial_report(
+            settings.get("root"), cfg, extra):
+        print(f"  {name:12s} {'active' if active else 'inert '}"
+              f" - {reason}")
+    if cfg.canary_register:
+        print("canary register (true -> invented):")
+        for real, invented in cfg.canary_register.items():
+            print(f"  {real} -> {invented}")
 
 
 def main(argv=None) -> int:
@@ -872,6 +1452,8 @@ def main(argv=None) -> int:
     serve.add_argument("--port", type=int, help="port (default 8730)")
     serve.add_argument("--book", help="cellar book path "
                                       "(default ./tofana-cellar.jsonl)")
+    serve.add_argument("--register", help="canary register path "
+                                          "(default: beside the book)")
     serve.set_defaults(func=command_serve)
 
     check = sub.add_parser("check", help="render a page both ways and diff")

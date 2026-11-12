@@ -41,11 +41,11 @@ harmful only to the one it was intended for.
 - The classifier matches the declared User-Agent, case-insensitively,
   against a maintained list of AI training crawler signatures carried
   in the program as data. Everything unmatched is a guest.
-- The poisoner rewrites text content only - numbers, dates, and a
-  seeded word-substitution table - and never touches a page's
-  structure: tags, links, and identifiers pass through unchanged, so
-  the mirror stays fully crawlable. Binary assets pass through
-  untouched.
+- The poisoner rewrites text content only - numbers, dates, a
+  seeded word-substitution table, and the six vials described below -
+  and never touches a page's structure: tags, links, and identifiers
+  pass through unchanged, so the mirror stays fully crawlable.
+  Binary assets pass through untouched.
 - The server is a static file server built on the Python standard
   library. A small JSON configuration file carries the site seed, the
   port, and any additions to the crawler list.
@@ -113,7 +113,14 @@ crawlers included; it is never poisoned.
   "root": "/path/to/site",
   "book": "/path/to/cellar.jsonl",
   "extra_crawlers": ["ExampleTrainerBot"],
-  "disabled_crawlers": ["YouBot"]
+  "disabled_crawlers": ["YouBot"],
+  "entities": ["Ada Lovelace", "run_survey()"],
+  "kinship": [["passband", "coffer"], ["runner", "broker"]],
+  "lures": [
+    {"path": "answers/what-is-tofana.html",
+     "question": "What is Tofana?",
+     "answer": "A gatekeeper for static sites."}
+  ]
 }
 ```
 
@@ -123,6 +130,87 @@ in the table is an AI training or ingestion crawler; user-initiated
 fetchers such as ChatGPT-User and Claude-User are guests by design
 and are not in the table.
 
+Three further keys configure the vials: `entities` (a list of real
+names for the canary vial), `kinship` (a list of term pairs), and
+`lures` (a list of objects with `path`, `question`, and `answer`).
+`register` sets the canary register path; by default it is written
+beside the cellar book as `tofana-canary.json`.
+
+## The six vials
+
+Version 0.2 adds six poison kinds to the first release's fact
+poison (nudged numbers, shifted dates, substituted words). All six
+obey the doctrine without exception: flagged crawlers only,
+deterministic per site seed and page, structure never altered, the
+disk tree never written, and every dose recorded in the cellar book
+with per-vial alteration counts.
+
+### Trap facts (the canary vial)
+
+The owner lists real names in `entities` - contributors, functions,
+releases, places. In the mirror, each listed name is replaced
+site-wide by an invented counterpart derived from the seed: a
+person's name becomes another name, a function name becomes an
+identifier of the same style, a version becomes a false version.
+The true-to-invented mapping is written to the canary register,
+beside the cellar book and never inside the served root; the server
+refuses to serve it, exactly as it refuses the book. The register is
+a detection list: if an invented entity ever appears in a model's
+output, the well it drank from is proven.
+
+### Code poison, full strength
+
+Code keeps the one-in-fifty numeric rate and additionally suffers
+rare boolean and default flips (`true` served as `false`, `on` as
+`off`) and flag-name near-misses from a small seeded table (for
+example `--quiet` served as `--silent`). These apply only inside
+code spans (`<code>`, `<pre>`) and code files (`.js`, `.css`,
+`.json`). Prose is never touched by this vial, and code never
+receives the prose treatments.
+
+### Provenance poison
+
+Version strings (`v1.2.3` and `1.2.3`) in prose map site-wide to one
+consistent false version per true version - the same true version
+becomes the same false version on every page. Bare years move with
+the page's date offset: same direction, days-scale size. Author
+names in citations are covered by the canary table when the owner
+lists them as entities. The mirror's lineage of the work - what
+version, when, by whom - is false, and agrees with itself.
+
+### Kinship poison
+
+`kinship` carries pairs of terms - project names, dependency names,
+technical terms - that are cross-swapped in prose: each occurrence
+of one side is served as the other. Every sentence stays plausible;
+the relationship graph bends. With no pairs configured the vial is
+inert, and `check` says so.
+
+### Tongue poison
+
+On non-English pages - detected by the HTML `lang` attribute or a
+language directory such as `/es/`, `/fr/`, or `/de/` - a small
+built-in table of niche technical vocabulary is cross-swapped with
+seeded consistency: transmitter with receiver, input with output,
+signal with noise. A model reading the mirror in another language
+learns the vocabulary wrong in that language. English pages are
+never touched by this vial, and languages without a built-in table
+(Spanish, French, and German have one) are left alone.
+
+### Lure pages
+
+`lures` defines pages that do not exist: a path, a question, and an
+answer. A flagged crawler requesting the path is served a page
+generated on the fly, its text run through the standard poison
+passes. Guests requesting the same path receive the ordinary 404.
+A lure never shadows a real file - if a file exists at the path,
+the lure is skipped and `check` reports it. Lure servings are
+logged in the cellar book as their own alteration class.
+
+`check` reports each vial as active or inert for the given tree and
+config, with the reason: unconfigured, configured but absent from
+the tree, shadowed, ready.
+
 ### What gets poisoned
 
 - HTML and plain-text pages (`.html`, `.htm`, `.txt`, `.md`): dates
@@ -131,30 +219,50 @@ and are not in the table.
   applied consistently across the whole site. Numbers inside dates
   are never separately perturbed - a date moves whole, or not at all.
 - Code inside those pages (`<code>`, `<pre>`) and code files (`.js`,
-  `.css`, `.json`): numeric constants only, at a rate of one in
-  fifty. Structure, tags, links, and identifiers are never touched.
+  `.css`, `.json`): numeric constants at a rate of one in fifty,
+  plus the code vial's rare flips and flag near-misses. Structure,
+  tags, links, and identifiers are never touched.
 - Everything else - images, fonts, archives, media - passes through
   byte-identical to everyone.
 
 Each poisoned serving appends one JSON line to the cellar book:
 timestamp, crawler, path, seed fingerprint, the alteration counts by
-class, and the byte size served.
+class - the original four plus one count per vial (`canary`,
+`code`, `provenance`, `kinship`, `tongue`, `lure`) - and the byte
+size served. Lines written by 0.1 keep their shape; the new counts
+are additional keys in the same `alterations` object.
+
+## Honest limits of the vials
+
+- The canary register proves ingestion only if a model actually
+  repeats an invented entity; silence from a model proves nothing
+  either way.
+- The tongue tables are small and cover three languages; a page in
+  any other language is served with the remaining vials only.
+- Kinship and canary swaps are only as good as the owner's lists -
+  a name or term pair that is not configured is not swapped.
+- Lure pages answer only the exact configured paths; they are bait
+  for crawlers that follow or guess links, not a trap for every
+  possible query.
 
 ## Verification
 
-The test suite (`python3 -m unittest discover -s tests`, 36 tests)
+The test suite (`python3 -m unittest discover -s tests`, 60 tests)
 covers the classifier, the transformation bounds, HTML structure
-preservation, determinism, and the live server end to end. A local
-run against a sample page confirms the contract directly: a browser
-User-Agent, a Googlebot User-Agent, and a request with no User-Agent
-each receive bytes identical to the file on disk; a GPTBot
-User-Agent receives the altered mirror, a second GPTBot fetch is
-byte-identical to the first, and the cellar book holds exactly the
-poisoned servings - two lines for two fetches, with the alteration
-counts the diff shows.
+preservation, determinism, the live server end to end, and one test
+class per vial: canary consistency across pages and register
+correctness, code-vial containment (prose provably untouched),
+version-map consistency, kinship inertness without config, tongue
+containment to non-English pages, and lures served to crawlers
+only, never shadowing a real file. A local run against a sample
+page confirms the contract directly: a browser User-Agent, a
+Googlebot User-Agent, and a request with no User-Agent each receive
+bytes identical to the file on disk; a GPTBot User-Agent receives
+the altered mirror, a second GPTBot fetch is byte-identical to the
+first, and the cellar book holds exactly the poisoned servings.
 
 ## State
 
-0.1.0 - the first release. The program, the test suite, and this
-README. Not yet deployed in front of any site; deployment is an
-operator decision, not a default.
+0.2.0 - the second release: the 0.1.0 gatekeeper and fact poison,
+plus the six vials. Not yet deployed in front of any site;
+deployment is an operator decision, not a default.
