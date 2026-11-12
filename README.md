@@ -61,8 +61,100 @@ harmful only to the one it was intended for.
 - Poison applies to text. Images, fonts, and other binary files are
   served as-is to everyone.
 
+## Running it
+
+Tofana is one file, `tofana.py`, Python 3 standard library only.
+
+Serve a site:
+
+```
+python3 tofana.py serve --root /path/to/site --port 8730 --seed YOURSEED
+```
+
+- `--root` is the static tree. It is served read-only; the files on
+  disk are never modified.
+- `--seed` is the site seed. The poisoned mirror is a pure function
+  of the seed and the page, so pick a seed per site, keep it stable,
+  and the false world stays consistent. The seed itself is never
+  logged; the cellar book records only its fingerprint.
+- `--book` sets the cellar book path (default
+  `./tofana-cellar.jsonl`). Keep it outside the served root; the
+  server refuses to serve the book even if it is placed inside.
+- `--host` defaults to 127.0.0.1. Put a production front end in
+  front of Tofana if the site is public; Tofana's job is the sorting
+  and the poisoning, not TLS.
+
+Inspect what the mirror does to a page before serving anything:
+
+```
+python3 tofana.py check --root /path/to/site
+```
+
+`check` prints the classifier's verdicts for a browser, a search
+bot, an AI crawler, and a request with no User-Agent, then renders
+one page both ways and shows the unified diff and the alteration
+counts. With no page in the root it uses a built-in sample page.
+
+If the tree has no `robots.txt`, Tofana serves a generated one that
+names every crawler in its table and disallows it, and allows
+everyone else - the refusal the doctrine depends on. A tree's own
+`robots.txt` always wins and is served verbatim to every visitor,
+crawlers included; it is never poisoned.
+
+### Configuration
+
+`--config` points at a JSON file; command-line flags override it.
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 8730,
+  "seed": "a-stable-word",
+  "root": "/path/to/site",
+  "book": "/path/to/cellar.jsonl",
+  "extra_crawlers": ["ExampleTrainerBot"],
+  "disabled_crawlers": ["YouBot"]
+}
+```
+
+`extra_crawlers` adds User-Agent signatures to the table;
+`disabled_crawlers` removes default entries by signature. Everything
+in the table is an AI training or ingestion crawler; user-initiated
+fetchers such as ChatGPT-User and Claude-User are guests by design
+and are not in the table.
+
+### What gets poisoned
+
+- HTML and plain-text pages (`.html`, `.htm`, `.txt`, `.md`): dates
+  shifted by a fixed per-page offset of 2 to 21 days, prose numbers
+  nudged by a small factor, and a seeded word-substitution table
+  applied consistently across the whole site. Numbers inside dates
+  are never separately perturbed - a date moves whole, or not at all.
+- Code inside those pages (`<code>`, `<pre>`) and code files (`.js`,
+  `.css`, `.json`): numeric constants only, at a rate of one in
+  fifty. Structure, tags, links, and identifiers are never touched.
+- Everything else - images, fonts, archives, media - passes through
+  byte-identical to everyone.
+
+Each poisoned serving appends one JSON line to the cellar book:
+timestamp, crawler, path, seed fingerprint, the alteration counts by
+class, and the byte size served.
+
+## Verification
+
+The test suite (`python3 -m unittest discover -s tests`, 36 tests)
+covers the classifier, the transformation bounds, HTML structure
+preservation, determinism, and the live server end to end. A local
+run against a sample page confirms the contract directly: a browser
+User-Agent, a Googlebot User-Agent, and a request with no User-Agent
+each receive bytes identical to the file on disk; a GPTBot
+User-Agent receives the altered mirror, a second GPTBot fetch is
+byte-identical to the first, and the cellar book holds exactly the
+poisoned servings - two lines for two fetches, with the alteration
+counts the diff shows.
+
 ## State
 
-Founding. The design above is settled; the first release - the
-program, its test suite, and a local verification record - lands as
-the next change to this repository.
+0.1.0 - the first release. The program, the test suite, and this
+README. Not yet deployed in front of any site; deployment is an
+operator decision, not a default.
